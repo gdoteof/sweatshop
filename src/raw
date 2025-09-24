@@ -1,0 +1,296 @@
+// ----------------------------------------------------------------------------
+// horse-betting-data-crawler — scaffolding to build an idempotent crawl index
+// pnpm + Prisma + Restate + Zod + Bottleneck + Cheerio + Undici
+// ----------------------------------------------------------------------------
+// This single file is organized as a multi-file template. Copy each "FILE:" block
+// into your project structure. Everything compiles in TS/Node 20+.
+// ----------------------------------------------------------------------------
+
+// FILE: package.json (suggested)
+// {
+//   "name": "horse-betting-data-crawler",
+//   "private": true,
+//   "type": "module",
+//   "engines": { "node": ">=20" },
+//   "scripts": {
+//     "dev": "tsx src/dev.ts",
+//     "serve": "tsx src/services/restated.ts",
+//     "prisma:gen": "prisma generate",
+//     "prisma:push": "prisma db push",
+//     "lint": "eslint .",
+//     "typecheck": "tsc -p tsconfig.json"
+//   },
+//   "dependencies": {
+//     "@restate-dev/restate-sdk": "^0.8.5",
+//     "@prisma/client": "^5.18.0",
+//     "bottleneck": "^2.19.5",
+//     "cheerio": "^1.0.0-rc.12",
+//     "pino": "^9.3.2",
+//     "pino-pretty": "^11.2.2",
+//     "undici": "^6.19.8",
+//     "zod": "^3.23.8"
+//   },
+//   "devDependencies": {
+//     "prisma": "^5.18.0",
+//     "tsx": "^4.19.2",
+//     "typescript": "^5.6.2",
+//     "eslint": "^9.9.0",
+//     "@types/node": "^20.14.12"
+//   }
+// }
+
+// FILE: prisma/schema.prisma
+// generator client {
+//   provider = "prisma-client-js"
+// }
+// datasource db {
+//   provider = "postgresql"
+//   url      = env("DATABASE_URL")
+// }
+//
+// // ---- Core source-of-truth (Silver-ish) minimal footprint for indexing ----
+// model Track {
+//   id        BigInt  @id @default(autoincrement())
+//   source    String  // e.g., "SiteA"
+//   code      String?
+//   name      String
+//   country   String?
+//   timezone  String?
+//   // vendor natural key(s)
+//   vendorId  String? @unique
+//   createdAt DateTime @default(now())
+//   updatedAt DateTime @updatedAt
+//   // relations
+//   days      TrackDay[]
+//   @@unique([source, name])
+// }
+//
+// model TrackDay {
+//   id        BigInt  @id @default(autoincrement())
+//   trackId   BigInt
+//   date      DateTime // local date at track start-of-day; store with TZ in app
+//   status    String   // scheduled|official|cancelled|partial
+//   createdAt DateTime @default(now())
+//   updatedAt DateTime @updatedAt
+//   track     Track    @relation(fields: [trackId], references: [id], onDelete: Cascade)
+//   races     Race[]
+//   @@unique([trackId, date])
+// }
+//
+// model Race {
+//   id         BigInt  @id @default(autoincrement())
+//   trackDayId BigInt
+//   number     Int
+//   surface    String?
+//   distanceM  Int?
+//   classCode  String?
+//   status     String   // scheduled|official|cancelled
+//   offTimeUtc DateTime?
+//   createdAt  DateTime @default(now())
+//   updatedAt  DateTime @updatedAt
+//   trackDay   TrackDay @relation(fields: [trackDayId], references: [id], onDelete: Cascade)
+//   @@unique([trackDayId, number])
+// }
+//
+// // ---- Crawl Index (idempotent discovery queue) ----
+// model CrawlTarget {
+//   id        BigInt  @id @default(autoincrement())
+//   source    String  // adapter/source key
+//   kind      String  // 'index' | 'track' | 'track-day' | 'race'
+//   url       String
+//   parentId  BigInt? // link to parent target (optional)
+//   // deterministic de-duplication key ensures idempotent adds
+//   dedupeKey String  @unique
+//   discoveredAt DateTime @default(now())
+//   // status machine
+//   status    String  @default("pending") // pending|processing|done|error|skipped
+//   lastError String?
+//   updatedAt DateTime @updatedAt
+//   parent    CrawlTarget? @relation("Parent", fields: [parentId], references: [id])
+//   children  CrawlTarget[] @relation("Parent")
+//   @@index([source, kind])
+//   @@index([status])
+// }
+//
+// // ---- Raw ingest (append-only) ----
+// model RawIngest {
+//   id         BigInt  @id @default(autoincrement())
+//   source     String
+//   url        String
+//   fetchedAt  DateTime
+//   httpStatus Int
+//   contentSha String
+//   content    Bytes   // raw bytes (or move to external store and save pointer)
+//   meta       Json?
+//   // enforce idempotency on identical bytes from same source at same URL
+//   uniq       String  @unique // e.g., sha256(source + "|" + url + "|" + contentSha)
+//   createdAt  DateTime @default(now())
+//   @@index([source, url])
+// }
+//
+// // ---- Vendor crosswalk for mapping incoming keys later ----
+// model VendorKey {
+//   id        BigInt  @id @default(autoincrement())
+//   vendor    String
+//   type      String   // 'track' | 'race' | 'horse' | ...
+//   vendorId  String
+//   ourType   String
+//   ourId     BigInt?
+//   meta      Json?
+//   createdAt DateTime @default(now())
+//   updatedAt DateTime @updatedAt
+//   @@unique([vendor, type, vendorId])
+// }
+
+// FILE: tsconfig.json (suggested)
+// {
+//   "compilerOptions": {
+//     "target": "ES2022",
+//     "module": "ESNext",
+//     "moduleResolution": "Bundler",
+//     "strict": true,
+//     "esModuleInterop": true,
+//     "skipLibCheck": true,
+//     "types": ["node"],
+//     "outDir": "dist",
+//     "resolveJsonModule": true
+//   },
+//   "include": ["src"]
+// }
+
+// FILE: src/db.ts
+import { PrismaClient } from "@prisma/client";
+export const prisma = new PrismaClient();
+
+// FILE: src/log.ts
+import pino from "pino";
+export const log = pino({ level: process.env.LOG_LEVEL || "info" });
+
+// FILE: src/types.ts
+import { z } from "zod";
+
+export const CrawlKind = z.enum(["index", "track", "track-day", "race"]);
+export type CrawlKind = z.infer<typeof CrawlKind>;
+
+export const DiscoveredItem = z.object({
+  kind: CrawlKind,
+  url: z.string().url(),
+  // Optional metadata that adapters can pass downstream
+  meta: z.record(z.any()).optional(),
+});
+export type DiscoveredItem = z.infer<typeof DiscoveredItem>;
+
+// Adapter contract
+
+// FILE: src/http.ts (fetch + rate limit + basic retry)
+import Bottleneck from "bottleneck";
+import { request } from "undici";
+import crypto from "node:crypto";
+import { prisma } from "./db";
+import { log } from "./log";
+
+const limiter = new Bottleneck({
+  minTime: Number(process.env.MIN_REQUEST_MS || 250),
+  maxConcurrent: Number(process.env.MAX_CONCURRENCY || 8),
+});
+
+export type FetchResult = {
+  url: string;
+  status: number;
+  body: Buffer;
+  headers: Record<string, string>;
+};
+
+export async function limitedFetch(url: string): Promise<FetchResult> {
+  return limiter.schedule(async () => {
+    for (let attempt = 1; attempt <= 4; attempt++) {
+      try {
+        const res = await request(url, {
+          method: "GET",
+          headers: { "user-agent": "horse-crawler/1.0" },
+        });
+        const body = Buffer.from(await res.body.arrayBuffer());
+        const headers: Record<string, string> = {};
+        for (const [k, v] of res.headers) headers[k] = String(v);
+        return { url, status: res.statusCode, body, headers };
+      } catch (err) {
+        const backoff = 250 * Math.pow(2, attempt - 1);
+        log.warn({ err, url, attempt }, "fetch failed; retrying");
+        await new Promise((r) => setTimeout(r, backoff));
+      }
+    }
+    throw new Error(`Failed to fetch after retries: ${url}`);
+  });
+}
+
+// RawIngest write (append-only, idempotent via uniq sha)
+export async function recordRaw(
+  source: string,
+  url: string,
+  status: number,
+  body: Buffer,
+  meta?: Record<string, unknown>
+) {
+  const contentSha = crypto.createHash("sha256").update(body).digest("hex");
+  const uniq = crypto
+    .createHash("sha256")
+    .update(`${source}|${url}|${contentSha}`)
+    .digest("hex");
+  try {
+    await prisma.rawIngest.create({
+      data: {
+        source,
+        url,
+        fetchedAt: new Date(),
+        httpStatus: status,
+        contentSha,
+        content: body,
+        meta,
+        uniq,
+      },
+    });
+  } catch (e: any) {
+    // Unique violation => already have this exact payload; fine.
+    if (!String(e.message).includes("Unique constraint failed")) throw e;
+  }
+}
+
+// FILE: src/indexer.ts (idempotent crawl-index builder)
+
+// FILE: src/adapters/base.ts
+
+// FILE: src/adapters/exampleSiteA.ts (stub adapter demonstrating patterns)
+
+// FILE: src/services/restated.ts (Restate handlers for idempotent discovery)
+
+// FILE: src/dev.ts (local driver to seed index + run one pass)
+
+// ----------------------------------------------------------------------------
+// NOTES / HOW THIS MEETS YOUR GOALS
+// ----------------------------------------------------------------------------
+// 1) Idempotent crawl index
+//    - CrawlTarget.dedupeKey unique index prevents duplicate enqueueing for the
+//      same (source, kind, url, parent). Create-anywhere; safe to retry.
+//    - Status machine allows at-least-once processing semantics with retries.
+//
+// 2) Adapters per source
+//    - Each adapter implements discoverTracks/TrackDays/Races and returns URLs.
+//    - Pagination and one-page-with-anchors patterns handled in adapter logic.
+//
+// 3) Partial data & multi-source future
+//    - This layer only *discovers* URLs (no parsing facts yet). RawIngest records
+//      the exact payloads you fetch for reproducibility. A later "normalize"
+//      step can merge partials from multiple vendors keyed via VendorKey.
+//
+// 4) Raw ingest
+//    - recordRaw() stores every response with a stable uniq hash to dedupe.
+//
+// 5) Ready to evolve
+//    - Add parser services that consume 'race' CrawlTargets, parse facts from
+//      RawIngest payloads, and upsert into Silver tables (Track/TrackDay/Race…)
+//      with proper natural keys. Keep Gold aggregates out of this layer.
+//
+// 6) Ops
+//    - Use Restate for durable retries. Use GetPending to fan out workers.
+//    - Bottleneck limits and undici fetch with exponential backoff.
+// ----------------------------------------------------------------------------

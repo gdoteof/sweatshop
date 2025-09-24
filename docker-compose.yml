@@ -1,0 +1,18 @@
+version: '3.9'
+services:
+  db:
+    image: postgres:16
+    container_name: horse_pg
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: app
+      POSTGRES_DB: horse
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # Extend TOAST settings a touch (optional; PG already compresses large bytea)
+      - ./postgres-init:/docker-entrypoint-initdb.d
+volumes:
+  pgdata:

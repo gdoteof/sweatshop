@@ -1,0 +1,72 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+// Looking for ways to speed up your queries, or scale easily with your serverless or edge functions?
+// Try Prisma Accelerate: https://pris.ly/cli/accelerate-init
+
+generator client {
+  provider = "prisma-client"
+  output   = "../generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+
+model Race {
+  id      String   @id @default(cuid())
+  date    DateTime
+  results Result[]
+
+  track   Track  @relation(fields: [trackId], references: [id])
+  trackId String
+
+  jockey   Jockey @relation(fields: [jockeyId], references: [id])
+  jockeyId String
+
+  trainer   Trainer @relation(fields: [trainerId], references: [id])
+  trainerId String
+}
+
+model Result {
+  id        String  @id @default(cuid())
+  position  Int
+  horse     String
+  jockey    Jockey  @relation(fields: [jockeyId], references: [id])
+  jockeyId  String
+  trainer   Trainer @relation(fields: [trainerId], references: [id])
+  trainerId String
+  raceTime  Int?
+  money     Int
+  race      Race    @relation(fields: [raceId], references: [id])
+  raceId    String
+  scratch   Boolean
+}
+
+model Track {
+  id       String @id @default(cuid())
+  name     String
+  location String
+  races    Race[]
+}
+
+model Jockey {
+  id    String @id @default(cuid())
+  name  String
+  age   Int
+  races Race[]
+
+  Result Result[]
+}
+
+model Trainer {
+  id    String @id @default(cuid())
+  name  String
+  age   Int
+  wins  Int
+  races Race[]
+
+  Result Result[]
+}
