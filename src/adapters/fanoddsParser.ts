@@ -14,7 +14,7 @@ export interface RaceScrapeInfo {
 
 export interface RaceResultRow {
     position: number;
-    horse: string;
+    horseName: string;
     jockey: string;
     trainer: string;
     raceTime: { minutes: number; seconds: number; milliseconds: number } | null;
@@ -48,6 +48,7 @@ export interface ScrapeResult {
 import { fetch as undiciFetch } from "undici";
 import prisma from "../db";
 import { parseTrackLengthToMeters } from "./parseTrackLength";
+import type { Race, TrackDay } from "../../generated/prisma/client";
 const nodeFetch: typeof fetch = (globalThis as any).fetch ?? undiciFetch;
 
 /*
@@ -205,7 +206,7 @@ export async function fanoddsScrapeDay(url: string): Promise<ScrapeResult> {
 
                 const finisher: RaceResultRow = {
                     position,
-                    horse,
+                    horseName: horse,
                     jockey,
                     trainer,
                     raceTime: null,
@@ -238,12 +239,11 @@ export async function scrapeAndSaveRaceResults(url: string) {
     create: { source: trackSource, name: trackName, timezone: timezoneGuess },
   });
 
-  // 2) Build unique sets of people/horses
   const allResults = data.raceResults.flatMap(r => r.results);
 
   const jockeyNames = Array.from(new Set(allResults.map(r => r.jockey).filter(Boolean)));
   const trainerNames = Array.from(new Set(allResults.map(r => r.trainer).filter(Boolean)));
-  const horseNames   = Array.from(new Set(allResults.map(r => r.horse).filter(Boolean)));
+  const horseNames   = Array.from(new Set(allResults.map(r => r.horseName).filter(Boolean)));
 
   // 3) Ensure Jockey records exist
   const existingJockeys = await prisma.jockey.findMany({
@@ -262,7 +262,6 @@ export async function scrapeAndSaveRaceResults(url: string) {
   });
   const jockeyIdByName = new Map(jockeyRows.map(j => [j.name, j.id]));
 
-  // 4) Ensure Trainer records exist
   const existingTrainers = await prisma.trainer.findMany({
     where: { name: { in: trainerNames } },
     select: { id: true, name: true },
@@ -279,8 +278,6 @@ export async function scrapeAndSaveRaceResults(url: string) {
   });
   const trainerIdByName = new Map(trainerRows.map(t => [t.name, t.id]));
 
-  // 5) (Optional) Ensure Horse records exist — your Result stores `horse` as string,
-  //    but you also have a Horse model used elsewhere. Keep these in sync.
   const existingHorses = await prisma.horse.findMany({
     where: { name: { in: horseNames } },
     select: { id: true, name: true },
@@ -291,9 +288,14 @@ export async function scrapeAndSaveRaceResults(url: string) {
       await prisma.horse.create({ data: { name, age: 0 } });
     }
   }
+  const horseRows = await prisma.horse.findMany({
+    where: { name: { in: horseNames } },
+    select: { id: true, name: true },
+  });
+  const horseIdByName = new Map(horseRows.map(h => [h.name, h.id]));
 
-  // 6) TrackDay: store the **track-local calendar date** in `date @db.Date`
-  //    and upsert by (trackId, date) -> input `trackId_date`
+  // store the **track-local calendar date** in `date @db.Date`
+  // and upsert by (trackId, date) -> input `trackId_date`
   const tzid = track.timezone ?? "UTC";
   const dateOnlyStr = dayjs.tz(data.raceInfo.date, tzid).format("YYYY-MM-DD");
   const dateOnly = new Date(dateOnlyStr); // Prisma accepts Date for @db.Date
@@ -330,7 +332,7 @@ export async function scrapeAndSaveRaceResults(url: string) {
       const rows = race.results.map((r) => ({
         raceId: savedRace.id,
         position: r.position,
-        horse: r.horse, // your Result model stores horse as string
+        horseId: horseIdByName.get(r.horseName)!, // non-null if created/found above
         jockeyId: jockeyIdByName.get(r.jockey)!,   // non-null if created/found above
         trainerId: trainerIdByName.get(r.trainer)!,// non-null if created/found above
         scratch: false,
@@ -351,4 +353,32 @@ export async function scrapeAndSaveRaceResults(url: string) {
     }
   });
   return data;
+}
+
+
+export async function formatRaceResults(trackDay: TrackDay) {
+    const results = await prisma.result.findMany({
+        where: { race: { trackDayId: trackDay.id } },
+        include: { horse: true, jockey: true, trainer: true, race: {
+            select: {
+                number: true,
+                trackDay: {
+                select: { track: true }
+            }} },
+        }
+    });
+
+    const trackName = results[0]?.race.trackDay.track.name;
+    const date = trackDay.date.toISOString().slice(0,10);
+
+    const groupedByRace = results.reduce((acc, result) => {
+        const raceNumber = result.race.number;
+        if (!acc[raceNumber]) {
+            acc[raceNumber] = [];
+        }
+        acc[raceNumber].push(result);
+        return acc;
+    }, {} as Record<number, typeof results>);
+
+    return { trackName, date, results: groupedByRace };
 }

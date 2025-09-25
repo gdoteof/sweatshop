@@ -14,26 +14,120 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
+model Track {
+  id        BigInt     @id @default(autoincrement())
+  source    String // e.g., "SiteA"
+  code      String?
+  name      String
+  country   String?
+  timezone  String?
+  // vendor natural key(s)
+  vendorId  String?    @unique
+  createdAt DateTime   @default(now())
+  updatedAt DateTime   @updatedAt
+  // relations
+  days      TrackDay[]
+
+  @@unique([source, name])
+}
+
+model TrackDay {
+  id        BigInt   @id @default(autoincrement())
+  trackId   BigInt
+  date      DateTime @db.Date // local date at track start-of-day; store with TZ in app
+  status    String // scheduled|official|cancelled|partial
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  track     Track    @relation(fields: [trackId], references: [id], onDelete: Cascade)
+  races     Race[]
+
+  @@unique([trackId, date])
+}
 
 model Race {
-  id      String   @id @default(cuid())
-  date    DateTime
-  results Result[]
+  id         BigInt    @id @default(autoincrement())
+  trackDayId BigInt
+  number     Int
+  surface    String?
+  distanceM  Int?
+  classCode  String?
+  status     String // scheduled|official|cancelled
+  offTimeUtc DateTime?
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+  trackDay   TrackDay  @relation(fields: [trackDayId], references: [id], onDelete: Cascade)
+  Jockey     Jockey[]
+  Result     Result[]
+  Trainer    Trainer[]
 
-  track   Track  @relation(fields: [trackId], references: [id])
-  trackId String
+  @@unique([trackDayId, number])
+  Horse Horse[]
+}
 
-  jockey   Jockey @relation(fields: [jockeyId], references: [id])
-  jockeyId String
+// ---- Crawl Index (idempotent discovery queue) ----
+model CrawlTarget {
+  id           BigInt        @id @default(autoincrement())
+  source       String // adapter/source key
+  kind         String // 'index' | 'track' | 'track-day' | 'race'
+  url          String
+  parentId     BigInt? // link to parent target (optional)
+  // deterministic de-duplication key ensures idempotent adds
+  dedupeKey    String        @unique
+  discoveredAt DateTime      @default(now())
+  // status machine
+  status       String        @default("pending") // pending|processing|done|error|skipped
+  lastError    String?
+  updatedAt    DateTime      @updatedAt
+  parent       CrawlTarget?  @relation("Parent", fields: [parentId], references: [id])
+  children     CrawlTarget[] @relation("Parent")
 
-  trainer   Trainer @relation(fields: [trainerId], references: [id])
-  trainerId String
+  @@index([source, kind])
+  @@index([status])
+}
+
+// ---- Raw ingest (append-only) ----
+model RawIngest {
+  id         BigInt         @id @default(autoincrement())
+  source     String
+  url        String
+  fetchedAt  DateTime
+  httpStatus Int
+  contentSha String
+  meta       Json?
+  uniq       String         @unique
+  createdAt  DateTime       @default(now())
+  // 1:1 to blob
+  blob       RawIngestBlob?
+
+  @@index([source, url])
+}
+
+model RawIngestBlob {
+  id          BigInt    @id @default(autoincrement())
+  rawIngestId BigInt    @unique
+  content     Bytes
+  raw         RawIngest @relation(fields: [rawIngestId], references: [id], onDelete: Cascade)
+}
+
+model VendorKey {
+  id        BigInt   @id @default(autoincrement())
+  vendor    String
+  type      String // 'track' | 'race' | 'horse' | ...
+  vendorId  String
+  ourType   String
+  ourId     BigInt?
+  meta      Json?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([vendor, type, vendorId])
 }
 
 model Result {
   id        String  @id @default(cuid())
   position  Int
-  horse     String
+  horse     Horse  @relation(fields: [horseId], references: [id])
+  horseId   String
   jockey    Jockey  @relation(fields: [jockeyId], references: [id])
   jockeyId  String
   trainer   Trainer @relation(fields: [trainerId], references: [id])
@@ -41,15 +135,10 @@ model Result {
   raceTime  Int?
   money     Int
   race      Race    @relation(fields: [raceId], references: [id])
-  raceId    String
+  raceId    BigInt
   scratch   Boolean
-}
 
-model Track {
-  id       String @id @default(cuid())
-  name     String
-  location String
-  races    Race[]
+
 }
 
 model Jockey {
@@ -66,6 +155,15 @@ model Trainer {
   name  String
   age   Int
   wins  Int
+  races Race[]
+
+  Result Result[]
+}
+
+model Horse {
+  id    String @id @default(cuid())
+  name  String
+  age   Int
   races Race[]
 
   Result Result[]

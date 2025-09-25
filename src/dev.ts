@@ -5,13 +5,22 @@ import { Indexer } from "./indexer";
 import  prisma  from "./db";
 import { log } from "./log";
 import { FanOddsAdapter } from "./adapters/fanOdds";
-import { fanoddsScrapeDay, scrapeAndSaveRaceResults } from "./adapters/fanoddsParser";
+import { fanoddsScrapeDay, formatRaceResults, scrapeAndSaveRaceResults } from "./adapters/fanoddsParser";
 
 async function main() {
   const A = new FanOddsAdapter();
   const indexUrls = [process.env.FANODDS_INDEX_URL || "https://www.fanodds.com/us/horse-racing/results"];
 
   const data = await scrapeAndSaveRaceResults('https://www.fanodds.com/us/horse-racing/results/durbanville/2025-09-22');
+
+  const trackDay = await prisma.trackDay.findFirst({
+      include: { races: true },
+  });
+  if(trackDay){
+    const formattedResults = await formatRaceResults(trackDay);
+    log.info({ formattedResults }, "formatted race results");
+  }
+  /*
   log.info({ data }, "sample scrape");
   // 1) Seed tracks from index
   await Indexer.addTracks(A, indexUrls);
@@ -29,6 +38,7 @@ async function main() {
   }
 
   log.info("dev seed pass complete");
+  */
 }
 
 main().catch((e) => {
